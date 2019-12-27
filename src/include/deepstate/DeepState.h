@@ -36,6 +36,9 @@
 #include <unistd.h>
 #include <fnmatch.h>
 #include <execinfo.h>
+#include <ucontext.h>
+
+#include <libunwind-ptrace.h>
 
 #include <deepstate/Log.h>
 #include <deepstate/Compiler.h>
@@ -57,6 +60,10 @@
 
 #ifndef DEEPSTATE_SIZE
 #define DEEPSTATE_SIZE 8192
+#endif
+
+#ifndef DEEPSTATE_CRASH_MAX_FRAMES
+#define DEEPSTATE_CRASH_MAX_FRAMES 63
 #endif
 
 #ifndef DEEPSTATE_MAX_SWARM_CONFIGS
@@ -524,21 +531,38 @@ extern void DeepState_SaveFailingTest(void);
 extern void DeepState_SaveCrashingTest(void);
 
 /* Emit test function backtrace after test crashes. */
-static void DeepState_EmitBacktrace(int signum, siginfo_t *sig, void *context) {
+static void DeepState_EmitBacktrace(int signum, siginfo_t *sig, void *_context) {
 
-  DeepState_LogFormat(DeepState_LogInfo, "Test crashed with: %s", sys_siglist[sig->si_status]);
+  /* output information about the signal caught and the exception that occurred */
+  const char *result;
+  if (!sig->si_status)
+    result = sys_siglist[signum];
+  else
+    result = sys_siglist[sig->si_status];
+  DeepState_LogFormat(DeepState_LogError, "Signal caught in test: %s (error: %d)", result, sig->si_signo);
 
-  void *array[10];
+  ucontext_t *context = (ucontext_t *) _context;
+  //printf("%lx", context->uc_mcontext.gregs[REG_RIP]);
+
+  /* return a backtrace */
   size_t size;
-  char **strings;
+  void *back_addrs[DEEPSTATE_CRASH_MAX_FRAMES];
+  char **symbols;
 
-  size = backtrace(array, 10);
-  strings = backtrace_symbols(array, size);
+  size = backtrace(back_addrs, DEEPSTATE_CRASH_MAX_FRAMES);
+  if (size == 0)
+    DeepState_Abandon("Cannot retrieve backtrace stack addresses");
 
+  symbols = backtrace_symbols(back_addrs, size);
+  if (symbols == NULL)
+    DeepState_Abandon("Cannot retrieve symbols for stack addresses");
+
+  DeepState_LogFormat(DeepState_LogTrace, "======= Backtrace: =========");
   for (size_t i = 0; i < size; i++)
-     DeepState_LogFormat(DeepState_LogTrace, "%s", strings[i]);
+     DeepState_LogFormat(DeepState_LogTrace, "%s", symbols[i]);
+  DeepState_LogFormat(DeepState_LogTrace, "===========================");
 
-  free(strings);
+  free(symbols);
 }
 
 
@@ -712,21 +736,18 @@ static int DeepState_RunTestNoFork(struct DeepState_TestInfo *test) {
 /* Fork and run `test`. */
 static enum DeepState_TestRunResult
 DeepState_ForkAndRunTest(struct DeepState_TestInfo *test) {
-
-  /* If flag is set, install a signal handler for SIGCHLD */
-  /* TODO(alan): use handler as "multiplexer" and handle child signal */
-  if (FLAGS_verbose_crash_trace) {
-    struct sigaction sigact, oldact;
-
-    sigact.sa_flags = SA_SIGINFO | SA_NOCLDWAIT;
-    sigact.sa_sigaction = DeepState_EmitBacktrace;
-
-    sigaction(SIGCHLD, &sigact, &oldact);
-  }
-
-
   pid_t test_pid;
   if (FLAGS_fork) {
+
+    /* If flag is set, install a signal handler for SIGCHLD */
+    if (FLAGS_verbose_crash_trace) {
+      struct sigaction sigact;
+      sigact.sa_flags = SA_SIGINFO | SA_NODEFER;
+      sigact.sa_sigaction = DeepState_EmitBacktrace;
+
+      sigaction(SIGCHLD, &sigact, 0);
+    }
+
     test_pid = fork();
     if (!test_pid) {
       DeepState_RunTest(test);
@@ -737,6 +758,8 @@ DeepState_ForkAndRunTest(struct DeepState_TestInfo *test) {
   if (FLAGS_fork) {
     waitpid(test_pid, &wstatus, 0);
   } else {
+
+    /* TODO: install multiplexer signal handler, since we need to handle more than SIGCHLD */
     wstatus = DeepState_RunTestNoFork(test);
     DeepState_CleanUp();
   }
